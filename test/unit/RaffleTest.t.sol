@@ -5,6 +5,8 @@ import {Raffle} from "../../src/Raffle.sol";
 import {DeployRaffle} from "../../script/DeployRaffle.s.sol";
 import {HelperConfig} from "../../script/HelperConfig.s.sol";
 import {Test, console} from "forge-std/Test.sol";
+import {Vm} from "forge-std/Vm.sol";
+import {VRFCoordinatorV2Mock} from "@chainlink/contracts/src/v0.8/mocks/VRFCoordinatorV2Mock.sol";
 
 contract RaffleTest is Test {
     /** Events */
@@ -97,6 +99,156 @@ contract RaffleTest is Test {
         raffle.enterRaffle{value: entranceFee}();
     }
 
+    /** Check upkeep */
+
+    function testCheckUpkeepReturnsFalseIfNotEnoughTimePassed() public {
+        // There are players
+        vm.prank(PLAYER_2);
+        raffle.enterRaffle{value: entranceFee}();
+
+        (bool upkeepNeeded, ) = raffle.checkUpkeep("");
+        assert(!upkeepNeeded);
+    }
+
+    function testCheckUpkeepReturnsFalseIfNoPlayers() public {
+        // Enough time has passed
+        vm.warp(block.timestamp + interval + 1);
+        vm.roll(block.number + 1);
+
+        (bool upkeepNeeded, ) = raffle.checkUpkeep("");
+        assert(!upkeepNeeded);
+    }
+
+    function testCheckUpkeepReturnsFalseIfRaffleNotOpen() public {
+        // There are players
+        vm.prank(PLAYER_2);
+        raffle.enterRaffle{value: entranceFee}();
+        // Enough time has passed
+        vm.warp(block.timestamp + interval + 1);
+        vm.roll(block.number + 1);
+        // We are however performing upkeep
+        raffle.performUpkeep("");
+
+        (bool upkeepNeeded, ) = raffle.checkUpkeep("");
+        assert(!upkeepNeeded);
+    }
+
+    function testCheckUpkeepReturnsTrueIfAllOkay() public {
+        // There are players
+        vm.prank(PLAYER_1);
+        raffle.enterRaffle{value: entranceFee}();
+        // Enough time has passed
+        vm.warp(block.timestamp + interval + 1);
+        vm.roll(block.number + 1);
+
+        (bool upkeepNeeded, ) = raffle.checkUpkeep("");
+        assert(upkeepNeeded);
+    }
+
+    /** Perform upkeep */
+
+    modifier checkUpkeepTrue() {
+        // There are players
+        vm.prank(PLAYER_1);
+        raffle.enterRaffle{value: entranceFee}();
+        // Enough time has passed
+        vm.warp(block.timestamp + interval + 1);
+        vm.roll(block.number + 1);
+        _;
+    }
+
+    function testPerformUpkeepCanRunIfCheckUpkeepTrue() public checkUpkeepTrue {
+        raffle.performUpkeep("");
+    }
+
+    function testPerformUpkeepRevertsIfCheckUpkeepFalse() public {
+        // There are players
+        vm.prank(PLAYER_1);
+        raffle.enterRaffle{value: entranceFee}();
+
+        // https://book.getfoundry.sh/cheatcodes/expect-revert
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                Raffle.Raffle__UpkeepNotNeeded.selector,
+                1, // number of players
+                0 // raffle state
+            )
+        );
+        raffle.performUpkeep("");
+    }
+
+    function testPerformUpkeepUpdatesRaffleStateAndEmitsEvent()
+        public
+        checkUpkeepTrue
+    {
+        vm.recordLogs();
+        raffle.performUpkeep(""); // This should emit requestId
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 requestId = entries[0].topics[2];
+        Raffle.RaffleState raffleState = raffle.getRaffleState();
+
+        assert(uint256(requestId) > 0);
+        assert(raffleState == Raffle.RaffleState.CALCULATING);
+    }
+
+    /** Fulfill random words */
+
+    function testFulfillRandomWordsCanOnlyBeCalledAfterPerformUpkeep(
+        uint256 requestId // fuzzing the request IDs
+    ) public checkUpkeepTrue {
+        vm.expectRevert("nonexistent request");
+        VRFCoordinatorV2Mock(vrfCoordinatorAddr).fulfillRandomWords(
+            requestId,
+            address(raffle)
+        );
+    }
+
+    function testFulfillRandomWordsPicksWinnerAndSendsMoney()
+        public
+        checkUpkeepTrue
+    {
+        // Add other random players
+        uint256 additionalEntrants = 5;
+        uint256 startingIndex = 1;
+        for (
+            uint256 i = startingIndex;
+            i < startingIndex + additionalEntrants;
+            i++
+        ) {
+            address newPlayer = address(uint160(i));
+            hoax(newPlayer, STARTING_USER_BALANCE); // prank + deal
+            raffle.enterRaffle{value: entranceFee}();
+        }
+
+        uint256 previousTimestamp = raffle.getLastTimestamp();
+        uint256 prize = raffle.getCurrentPrize();
+
+        vm.recordLogs();
+        raffle.performUpkeep(""); // This should emit requestId
+        Vm.Log[] memory entries = vm.getRecordedLogs();
+        bytes32 requestId = entries[0].topics[2];
+
+        // Pretend to be VRF to get random number and pick winner
+        VRFCoordinatorV2Mock(vrfCoordinatorAddr).fulfillRandomWords(
+            uint256(requestId),
+            address(raffle)
+        );
+
+        // Raffle state reset
+        assert(raffle.getRaffleState() == Raffle.RaffleState.OPEN);
+        // Number of players reset
+        assert(raffle.getNumberOfPlayers() == 0);
+        // Timestamp updated
+        assert(raffle.getLastTimestamp() > previousTimestamp);
+        // Has a recent winner
+        assert(raffle.getRecentWinner() != address(0));
+        // Winner got the prize
+        assertEq(
+            raffle.getRecentWinner().balance,
+            STARTING_USER_BALANCE + prize - entranceFee
+        );
+    }
+
     /** Withdrawal */
 
     function testOwnerWithdrawProfitsIsOnePercent() public {
@@ -124,7 +276,6 @@ contract RaffleTest is Test {
         uint256 startingOwnerBalance = raffle.getOwner().balance;
         vm.prank(raffle.getOwner());
         raffle.withdraw();
-
         vm.prank(raffle.getOwner());
         raffle.withdraw();
 
